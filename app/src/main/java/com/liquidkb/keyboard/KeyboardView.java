@@ -36,6 +36,11 @@ final class KeyboardView extends View {
     private int shift;
     private long lastShiftTap;
     private float heightScale = 1f, gap, rowH;
+    private float pushAmt, bounceAmt;
+    private boolean langAnim;
+    private long lastFrame, flashStart = -1;
+    private String flashText;
+    private final List<Key> pressedKeys = new ArrayList<>();
 
     private Bitmap bg;
     private long bgStamp = -2;
@@ -58,7 +63,7 @@ final class KeyboardView extends View {
     private final Runnable longPress = new Runnable() {
         @Override public void run() {
             if (lpKey == null || !lpKey.down) return;
-            if (lpKey.code == Key.C_SPACE) {
+            if (lpKey.code == Key.C_SPACE || lpKey.code == Key.C_LANG) {
                 active.remove(lpPointer);
                 lpKey.down = false;
                 lpKey = null;
@@ -116,6 +121,9 @@ final class KeyboardView extends View {
         haptic = Prefs.get(c, Prefs.HAPTIC) == 1;
         heightScale = Prefs.get(c, Prefs.HEIGHT) / 100f;
         gap = painter.dp(Prefs.get(c, Prefs.GAP));
+        pushAmt = Prefs.get(c, Prefs.PUSH) / 100f;
+        bounceAmt = Prefs.get(c, Prefs.BOUNCE) / 100f;
+        langAnim = Prefs.get(c, Prefs.LANGANIM) == 1;
         langMask = Prefs.get(c, Prefs.LANGS) & 3;
         if (langMask == 0) langMask = 3;
         if ((langMask & (1 << lang)) == 0) lang = (langMask & 1) != 0 ? Layouts.RU : Layouts.EN;
@@ -154,6 +162,32 @@ final class KeyboardView extends View {
             }
         }
         rebuild();
+        flashText = Layouts.NAMES[lang];
+        flashStart = SystemClock.uptimeMillis();
+        startWave();
+    }
+
+    /** Волна: клавиши по очереди «выпрыгивают» слева направо. */
+    private void startWave() {
+        if (!langAnim) return;
+        int w = Math.max(1, getWidth());
+        for (int i = 0; i < rows.size(); i++) {
+            for (Key k : rows.get(i)) {
+                // задержка в секундах переводится в долю длительности (0.30 с)
+                k.appear = -(0.14f * (k.cx() / w) + 0.035f * i) / 0.30f;
+                k.press = 0f;
+                k.vel = 0f;
+            }
+        }
+        invalidate();
+    }
+
+    private Key spaceKey() {
+        if (rows.isEmpty()) return null;
+        for (Key k : rows.get(rows.size() - 1)) {
+            if (k.kind == Key.SPACE) return k;
+        }
+        return null;
     }
 
     // ---------- размеры ----------
@@ -213,21 +247,17 @@ final class KeyboardView extends View {
 
     @Override
     protected void onDraw(Canvas c) {
+        long now = SystemClock.uptimeMillis();
+        float dt = lastFrame == 0 ? 0.016f : Math.min(0.05f, (now - lastFrame) / 1000f);
+        lastFrame = now;
+        boolean animating = step(dt);
+
         painter.drawPanel(c, getWidth(), getHeight(), bg);
-        boolean animating = false;
+        // сначала спокойные клавиши, потом нажатые — чтобы «набухшая» клавиша была сверху
         for (int pass = 0; pass < 2; pass++) {
             for (Key[] row : rows) {
                 for (Key k : row) {
-                    if (pass == 0) {
-                        float target = k.down ? 1f : 0f;
-                        if (Math.abs(k.press - target) > 0.01f) {
-                            k.press += (target - k.press) * (k.down ? 0.45f : 0.22f);
-                            animating = true;
-                        } else {
-                            k.press = target;
-                        }
-                    }
-                    boolean raised = k.press > 0.01f;
+                    boolean raised = Math.abs(k.press) > 0.01f || k.appear < 1f;
                     if (raised == (pass == 1)) {
                         painter.drawKey(c, k, labelFor(k), shift, rowH);
                     }
@@ -242,7 +272,73 @@ final class KeyboardView extends View {
             }
         }
         if (altKey != null) painter.drawAlt(c, altKey, altChars, altSel, getWidth());
+
+        // плашка с названием языка над пробелом
+        if (flashText != null) {
+            long el = now - flashStart;
+            Key sp = spaceKey();
+            if (el < 900 && sp != null) {
+                float al = Math.min(1f, el / 120f) * (el < 650 ? 1f : 1f - (el - 650) / 250f);
+                painter.drawPill(c, sp.cx(), sp.t - painter.dp(28), flashText, al);
+                animating = true;
+            } else {
+                flashText = null;
+            }
+        }
         if (animating) postInvalidateOnAnimation();
+        else lastFrame = 0;
+    }
+
+    /** Шаг физики: пружины клавиш, всплеск света, волна появления, расталкивание соседей. */
+    private boolean step(float dt) {
+        boolean busy = false;
+        float zeta = 0.95f - 0.65f * bounceAmt; // 0.95 — без отскока, 0.30 — желе
+        float stiff = 520f;
+        float damp = 2f * (float) Math.sqrt(stiff) * zeta;
+        pressedKeys.clear();
+        for (Key[] row : rows) {
+            for (Key k : row) {
+                float target = k.down ? 1f : 0f;
+                k.vel += (stiff * (target - k.press) - damp * k.vel) * dt;
+                k.press += k.vel * dt;
+                if (Math.abs(target - k.press) < 0.003f && Math.abs(k.vel) < 0.05f) {
+                    k.press = target;
+                    k.vel = 0f;
+                } else {
+                    busy = true;
+                }
+                if (k.ripple < 1f) {
+                    k.ripple = Math.min(1f, k.ripple + dt / 0.45f);
+                    busy = true;
+                }
+                if (k.appear < 1f) {
+                    k.appear = Math.min(1f, k.appear + dt / 0.30f);
+                    busy = true;
+                }
+                k.dx = 0f;
+                k.dy = 0f;
+                if (Math.abs(k.press) > 0.01f && k.kind == Key.CHAR) pressedKeys.add(k);
+            }
+        }
+        if (pushAmt > 0f && !pressedKeys.isEmpty()) {
+            float push = painter.dp(4) * pushAmt;
+            for (Key p : pressedKeys) {
+                float reach = (p.r - p.l) * 2.2f;
+                for (Key[] row : rows) {
+                    for (Key o : row) {
+                        if (o == p || o.kind == Key.SPACER) continue;
+                        float ddx = o.cx() - p.cx(), ddy = o.cy() - p.cy();
+                        float d = (float) Math.sqrt(ddx * ddx + ddy * ddy);
+                        if (d < 1f || d >= reach) continue;
+                        float f = 1f - d / reach;
+                        float m = push * f * f * p.press / d;
+                        o.dx += ddx * m;
+                        o.dy += ddy * m;
+                    }
+                }
+            }
+        }
+        return busy;
     }
 
     // ---------- касания ----------
@@ -255,7 +351,7 @@ final class KeyboardView extends View {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN:
                 Key k = findKey(e.getX(idx), e.getY(idx));
-                if (k != null) press(id, k);
+                if (k != null) press(id, k, e.getX(idx), e.getY(idx));
                 break;
             case MotionEvent.ACTION_MOVE:
                 for (int i = 0; i < e.getPointerCount(); i++) {
@@ -293,17 +389,20 @@ final class KeyboardView extends View {
         return best;
     }
 
-    private void press(int id, Key k) {
+    private void press(int id, Key k, float x, float y) {
         active.put(id, k);
         k.down = true;
+        k.tx = x - k.l;
+        k.ty = y - k.t;
+        k.ripple = 0f;
         buzz();
-        if (id == lpPointer) cancelLongPress();
+        if (id == lpPointer) cancelLp();
         if (k.code == Key.C_DEL) {
             emit(Key.C_DEL);
             repeatKey = k;
             handler.removeCallbacks(repeat);
             handler.postDelayed(repeat, 380);
-        } else if (k.alt != null || k.code == Key.C_SPACE) {
+        } else if (k.alt != null || k.code == Key.C_SPACE || k.code == Key.C_LANG) {
             lpKey = k;
             lpPointer = id;
             handler.removeCallbacks(longPress);
@@ -323,8 +422,8 @@ final class KeyboardView extends View {
         Key nk = findKey(x, y);
         if (nk != null && nk != cur) {
             cur.down = false;
-            if (id == lpPointer) cancelLongPress();
-            press(id, nk);
+            if (id == lpPointer) cancelLp();
+            press(id, nk, x, y);
         }
     }
 
@@ -333,7 +432,7 @@ final class KeyboardView extends View {
         active.remove(id);
         if (k == null) return;
         k.down = false;
-        if (id == lpPointer) cancelLongPress();
+        if (id == lpPointer) cancelLp();
         if (k == repeatKey) {
             handler.removeCallbacks(repeat);
             repeatKey = null;
@@ -353,7 +452,7 @@ final class KeyboardView extends View {
         fire(k);
     }
 
-    private void cancelLongPress() {
+    private void cancelLp() {
         handler.removeCallbacks(longPress);
         lpKey = null;
         lpPointer = -1;
@@ -371,13 +470,17 @@ final class KeyboardView extends View {
             case Key.C_SYM:
                 symbols = true;
                 rebuild();
+                startWave();
                 break;
             case Key.C_ABC:
                 symbols = false;
                 rebuild();
+                startWave();
                 break;
             case Key.C_LANG:
-                nextLang();
+                // один язык включён — глобус открывает выбор клавиатуры
+                if (langMask == 3) nextLang();
+                else emit(Key.C_PICKER);
                 break;
             case Key.C_ENTER:
             case Key.C_CLIP:
